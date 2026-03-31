@@ -14,6 +14,9 @@ pub enum Error {
     #[error("signing error: {0}")]
     Signature(#[from] signature::Error),
 
+    #[error("RSA error: {0}")]
+    Rsa(#[from] rsa::Error),
+
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

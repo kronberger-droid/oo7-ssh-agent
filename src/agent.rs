@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
 use ssh_agent_lib::proto::message::{
@@ -6,6 +8,7 @@ use ssh_agent_lib::proto::message::{
 use ssh_agent_lib::proto::Credential;
 use ssh_key::{LineEnding, PrivateKey, Signature};
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use crate::keyring::SshKeyring;
 use crate::keys;
@@ -14,19 +17,34 @@ use crate::keys;
 ///
 /// Each incoming Unix socket connection gets its own `Oo7Session`.
 /// Since `SshKeyring` is cheaply cloneable (`Arc`), all sessions
-/// share the same underlying keyring connection.
+/// share the same underlying keyring connection. The agent-level
+/// lock state is also shared via `Arc`.
 #[derive(Clone)]
 pub struct Oo7Session {
     keyring: SshKeyring,
+    /// Agent-level lock state, independent of the keyring's own lock.
+    /// `None` = unlocked, `Some(passphrase)` = locked.
+    /// SSH protocol requires UNLOCK to provide the same passphrase as LOCK.
+    lock_passphrase: Arc<Mutex<Option<Zeroizing<String>>>>,
 }
 
 impl Oo7Session {
     pub fn new(keyring: SshKeyring) -> Self {
-        Self { keyring }
+        Self {
+            keyring,
+            lock_passphrase: Arc::new(Mutex::new(None)),
+        }
     }
 
-    /// Attempt to unlock the collection if locked.
-    /// Returns Ok(()) if already unlocked or successfully unlocked.
+    /// Check if the agent is locked. Returns `Err(AgentError::Failure)` if locked.
+    fn check_agent_lock(&self) -> Result<(), AgentError> {
+        if self.lock_passphrase.lock().unwrap().is_some() {
+            return Err(AgentError::Failure);
+        }
+        Ok(())
+    }
+
+    /// Attempt to unlock the keyring collection if locked.
     async fn ensure_unlocked(&self) -> Result<(), AgentError> {
         if self.keyring.is_locked().await.map_err(AgentError::other)? {
             debug!("collection is locked, attempting unlock");
@@ -42,6 +60,8 @@ impl Oo7Session {
 #[ssh_agent_lib::async_trait]
 impl Session for Oo7Session {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
+        self.check_agent_lock()?;
+
         if let Err(e) = self.ensure_unlocked().await {
             warn!(error = %e, "could not unlock collection, returning empty identity list");
             return Ok(vec![]);
@@ -58,10 +78,12 @@ impl Session for Oo7Session {
             match self.keyring.get_secret(&meta.fingerprint).await {
                 Ok(secret) => match keys::parse_private_key(secret.as_bytes()) {
                     Ok(privkey) => {
-                        identities.push(Identity {
+                        let identity = Identity {
                             pubkey: keys::public_key_data(&privkey),
                             comment: meta.comment.clone(),
-                        });
+                        };
+                        drop(privkey);
+                        identities.push(identity);
                     }
                     Err(e) => {
                         warn!(
@@ -79,7 +101,6 @@ impl Session for Oo7Session {
                     );
                 }
             }
-            // `secret` dropped here → oo7::Secret::ZeroizeOnDrop cleans up
         }
 
         debug!(count = identities.len(), "returning identities");
@@ -87,6 +108,7 @@ impl Session for Oo7Session {
     }
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
+        self.check_agent_lock()?;
         self.ensure_unlocked().await?;
 
         let fingerprint = keys::fingerprint(&request.pubkey);
@@ -100,18 +122,19 @@ impl Session for Oo7Session {
 
         let privkey = keys::parse_private_key(secret.as_bytes())
             .map_err(AgentError::other)?;
-        // `secret` is still alive here but will be dropped at end of scope.
-        // oo7::Secret zeroizes on drop automatically.
+        drop(secret);
 
-        let signature = keys::sign(&privkey, &request.data)
+        let signature = keys::sign(&privkey, &request.data, request.flags)
             .map_err(AgentError::other)?;
-        // `privkey` dropped here. ssh_key::PrivateKey zeroizes key material.
+        drop(privkey);
 
         debug!(fingerprint = %fingerprint, "sign request completed");
         Ok(signature)
     }
 
     async fn add_identity(&mut self, identity: AddIdentity) -> Result<(), AgentError> {
+        self.check_agent_lock()?;
+
         let Credential::Key { privkey, comment } = identity.credential else {
             warn!("certificate credentials are not supported");
             return Err(AgentError::Failure);
@@ -127,9 +150,15 @@ impl Session for Oo7Session {
         let openssh = privkey
             .to_openssh(LineEnding::LF)
             .map_err(AgentError::other)?;
+        drop(privkey);
+
+        // Pass as Zeroizing<Vec<u8>> so the intermediate buffer is zeroized.
+        // oo7::Secret has From<Zeroizing<Vec<u8>>>.
+        let openssh_bytes = Zeroizing::new(openssh.as_bytes().to_vec());
+        drop(openssh);
 
         self.keyring
-            .store_key(openssh.as_bytes(), &fingerprint, &comment, algorithm)
+            .store_key(openssh_bytes, &fingerprint, &comment, algorithm)
             .await
             .map_err(AgentError::other)?;
 
@@ -138,6 +167,8 @@ impl Session for Oo7Session {
     }
 
     async fn remove_identity(&mut self, identity: RemoveIdentity) -> Result<(), AgentError> {
+        self.check_agent_lock()?;
+
         let fingerprint = keys::fingerprint(&identity.pubkey);
 
         self.keyring
@@ -150,6 +181,8 @@ impl Session for Oo7Session {
     }
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
+        self.check_agent_lock()?;
+
         self.keyring
             .delete_all_keys()
             .await
@@ -159,20 +192,31 @@ impl Session for Oo7Session {
         Ok(())
     }
 
-    async fn lock(&mut self, _passphrase: String) -> Result<(), AgentError> {
-        // SSH agent LOCK takes a passphrase, but we delegate to the
-        // Secret Service collection lock which has its own auth model.
-        // The passphrase is ignored.
-        self.keyring.lock().await.map_err(AgentError::other)?;
-        debug!("locked collection");
+    async fn lock(&mut self, passphrase: String) -> Result<(), AgentError> {
+        let passphrase = Zeroizing::new(passphrase);
+        let mut lock = self.lock_passphrase.lock().unwrap();
+        if lock.is_some() {
+            return Err(AgentError::Failure);
+        }
+        *lock = Some(passphrase);
+        debug!("agent locked");
         Ok(())
     }
 
-    async fn unlock(&mut self, _passphrase: String) -> Result<(), AgentError> {
-        // Same as lock — passphrase is ignored, unlock triggers
-        // the Secret Service's own prompt (pinentry/portal).
-        self.keyring.unlock().await.map_err(AgentError::other)?;
-        debug!("unlocked collection");
-        Ok(())
+    async fn unlock(&mut self, passphrase: String) -> Result<(), AgentError> {
+        let passphrase = Zeroizing::new(passphrase);
+        let mut lock = self.lock_passphrase.lock().unwrap();
+        match lock.as_ref() {
+            Some(stored) if stored.as_str() == passphrase.as_str() => {
+                *lock = None;
+                debug!("agent unlocked");
+                Ok(())
+            }
+            Some(_) => {
+                warn!("unlock failed: wrong passphrase");
+                Err(AgentError::Failure)
+            }
+            None => Ok(()),
+        }
     }
 }
