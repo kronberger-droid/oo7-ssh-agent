@@ -5,6 +5,7 @@ mod keys;
 mod socket;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use ssh_agent_lib::agent::listen;
@@ -21,6 +22,10 @@ struct Cli {
     /// Ignored when socket-activated by systemd.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Unlock prompt timeout in seconds.
+    #[arg(long, default_value = "30")]
+    timeout: u64,
 
     /// Increase log verbosity (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -41,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let keyring = SshKeyring::new().await?;
     info!("connected to Secret Service");
 
-    let session = Oo7Session::new(keyring);
+    let session = Oo7Session::new(keyring, Duration::from_secs(cli.timeout));
     let listener = socket::bind(&socket_path)?;
 
     info!("agent ready");

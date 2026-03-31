@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
@@ -26,13 +27,16 @@ pub struct Oo7Session {
     /// `None` = unlocked, `Some(passphrase)` = locked.
     /// SSH protocol requires UNLOCK to provide the same passphrase as LOCK.
     lock_passphrase: Arc<Mutex<Option<Zeroizing<String>>>>,
+    /// Timeout for keyring unlock prompts (pinentry/portal).
+    unlock_timeout: Duration,
 }
 
 impl Oo7Session {
-    pub fn new(keyring: SshKeyring) -> Self {
+    pub fn new(keyring: SshKeyring, unlock_timeout: Duration) -> Self {
         Self {
             keyring,
             lock_passphrase: Arc::new(Mutex::new(None)),
+            unlock_timeout,
         }
     }
 
@@ -44,13 +48,16 @@ impl Oo7Session {
         Ok(())
     }
 
-    /// Attempt to unlock the keyring collection if locked.
+    /// Attempt to unlock the keyring collection if locked, with a timeout.
     async fn ensure_unlocked(&self) -> Result<(), AgentError> {
         if self.keyring.is_locked().await.map_err(AgentError::other)? {
-            debug!("collection is locked, attempting unlock");
-            self.keyring
-                .unlock()
+            debug!("collection is locked, attempting unlock (timeout: {:?})", self.unlock_timeout);
+            tokio::time::timeout(self.unlock_timeout, self.keyring.unlock())
                 .await
+                .map_err(|_| {
+                    warn!("unlock prompt timed out after {:?}", self.unlock_timeout);
+                    AgentError::Failure
+                })?
                 .map_err(AgentError::other)?;
         }
         Ok(())
