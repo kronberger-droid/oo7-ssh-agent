@@ -1,0 +1,17 @@
+[package]
+name = "oo7-ssh-agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.0", features = ["derive"] }
+oo7 = { version = "0.6.0", features = ["tokio"] }
+signature = "2.2.0"
+ssh-agent-lib = "0.5.2"
+ssh-key = { version = "0.6.7", features = ["ed25519", "p256", "rsa"] }
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zeroize = { version = "1.8.2", features = ["derive"] }
