@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ssh_agent_lib::agent::Session;
 use ssh_agent_lib::error::AgentError;
@@ -29,6 +29,8 @@ pub struct Oo7Session {
     lock_passphrase: Arc<Mutex<Option<Zeroizing<String>>>>,
     /// Timeout for keyring unlock prompts (pinentry/portal).
     unlock_timeout: Duration,
+    /// Shared timestamp of last activity, for idle timeout.
+    last_activity: Arc<Mutex<Instant>>,
 }
 
 impl Oo7Session {
@@ -37,7 +39,18 @@ impl Oo7Session {
             keyring,
             lock_passphrase: Arc::new(Mutex::new(None)),
             unlock_timeout,
+            last_activity: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+
+    /// Returns the shared last-activity timestamp for idle timeout monitoring.
+    pub fn last_activity(&self) -> Arc<Mutex<Instant>> {
+        self.last_activity.clone()
+    }
+
+    /// Record activity to reset the idle timeout.
+    fn touch(&self) {
+        *self.last_activity.lock().unwrap() = Instant::now();
     }
 
     /// Check if the agent is locked. Returns `Err(AgentError::Failure)` if locked.
@@ -68,6 +81,7 @@ impl Oo7Session {
 impl Session for Oo7Session {
     async fn request_identities(&mut self) -> Result<Vec<Identity>, AgentError> {
         self.check_agent_lock()?;
+        self.touch();
 
         if let Err(e) = self.ensure_unlocked().await {
             warn!(error = %e, "could not unlock collection, returning empty identity list");
@@ -116,6 +130,7 @@ impl Session for Oo7Session {
 
     async fn sign(&mut self, request: SignRequest) -> Result<Signature, AgentError> {
         self.check_agent_lock()?;
+        self.touch();
         self.ensure_unlocked().await?;
 
         let fingerprint = keys::fingerprint(&request.pubkey);
@@ -141,6 +156,7 @@ impl Session for Oo7Session {
 
     async fn add_identity(&mut self, identity: AddIdentity) -> Result<(), AgentError> {
         self.check_agent_lock()?;
+        self.touch();
 
         let Credential::Key { privkey, comment } = identity.credential else {
             warn!("certificate credentials are not supported");
@@ -175,6 +191,7 @@ impl Session for Oo7Session {
 
     async fn remove_identity(&mut self, identity: RemoveIdentity) -> Result<(), AgentError> {
         self.check_agent_lock()?;
+        self.touch();
 
         let fingerprint = keys::fingerprint(&identity.pubkey);
 
@@ -189,6 +206,7 @@ impl Session for Oo7Session {
 
     async fn remove_all_identities(&mut self) -> Result<(), AgentError> {
         self.check_agent_lock()?;
+        self.touch();
 
         self.keyring
             .delete_all_keys()
@@ -200,6 +218,7 @@ impl Session for Oo7Session {
     }
 
     async fn lock(&mut self, passphrase: String) -> Result<(), AgentError> {
+        self.touch();
         let passphrase = Zeroizing::new(passphrase);
         let mut lock = self.lock_passphrase.lock().unwrap();
         if lock.is_some() {
@@ -211,6 +230,7 @@ impl Session for Oo7Session {
     }
 
     async fn unlock(&mut self, passphrase: String) -> Result<(), AgentError> {
+        self.touch();
         let passphrase = Zeroizing::new(passphrase);
         let mut lock = self.lock_passphrase.lock().unwrap();
         match lock.as_ref() {
