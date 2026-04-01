@@ -97,21 +97,25 @@ impl Session for Oo7Session {
         let mut identities = Vec::with_capacity(metas.len());
         for meta in &metas {
             match self.keyring.get_secret(&meta.fingerprint).await {
-                Ok(secret) => match keys::parse_private_key(secret.as_bytes()) {
-                    Ok(privkey) => {
-                        let identity = Identity {
-                            pubkey: keys::public_key_data(&privkey),
-                            comment: meta.comment.clone(),
-                        };
-                        drop(privkey);
-                        identities.push(identity);
-                    }
-                    Err(e) => {
-                        warn!(
-                            fingerprint = %meta.fingerprint,
-                            error = %e,
-                            "skipping unparseable SSH key"
-                        );
+                Ok(secret) => {
+                    let parse_result = keys::parse_private_key(secret.as_bytes());
+                    drop(secret); // zeroize PEM bytes immediately
+                    match parse_result {
+                        Ok(privkey) => {
+                            let identity = Identity {
+                                pubkey: keys::public_key_data(&privkey),
+                                comment: meta.comment.clone(),
+                            };
+                            drop(privkey);
+                            identities.push(identity);
+                        }
+                        Err(e) => {
+                            warn!(
+                                fingerprint = %meta.fingerprint,
+                                error = %e,
+                                "skipping unparseable SSH key"
+                            );
+                        }
                     }
                 },
                 Err(e) => {

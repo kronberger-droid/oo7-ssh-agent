@@ -1,5 +1,4 @@
 use std::env;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +41,17 @@ fn try_socket_activation() -> Result<Option<UnixListener>> {
         return Ok(None);
     }
 
+    // Validate LISTEN_PID matches our PID per sd_listen_fds(3) spec.
+    if let Ok(pid_str) = env::var("LISTEN_PID") {
+        let expected_pid: u32 = pid_str
+            .parse()
+            .context("LISTEN_PID is not a valid integer")?;
+        if expected_pid != std::process::id() {
+            debug!("LISTEN_PID mismatch (expected {expected_pid}, got {}), ignoring", std::process::id());
+            return Ok(None);
+        }
+    }
+
     info!("using socket-activated fd (LISTEN_FDS={listen_fds})");
 
     // SAFETY: fd 3 is passed by systemd and is a valid, open socket.
@@ -60,11 +70,14 @@ fn bind_new(path: &Path) -> Result<UnixListener> {
             .with_context(|| format!("failed to remove stale socket at {}", path.display()))?;
     }
 
+    // Set restrictive umask before bind so the socket is created with 0o600.
+    // This eliminates the permission race between bind() and chmod().
+    // SAFETY: umask is a process-wide setting but we restore it immediately.
+    let old_umask = unsafe { libc::umask(0o177) };
     let listener = UnixListener::bind(path)
-        .with_context(|| format!("failed to bind socket at {}", path.display()))?;
-
-    // Restrict to owner only.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        .with_context(|| format!("failed to bind socket at {}", path.display()));
+    unsafe { libc::umask(old_umask) };
+    let listener = listener?;
 
     info!(path = %path.display(), "listening on socket");
     Ok(listener)

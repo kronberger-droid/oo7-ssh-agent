@@ -2,6 +2,7 @@ use signature::{SignatureEncoding, Signer};
 use ssh_key::private::KeypairData;
 use ssh_key::public::KeyData;
 use ssh_key::{Algorithm, HashAlg, PrivateKey, Signature};
+use tracing::warn;
 
 use crate::error::Result;
 
@@ -78,6 +79,7 @@ fn sign_rsa(
         let sig = SigningKey::<sha2::Sha256>::new(private_key).sign(data);
         ("rsa-sha2-256", sig.to_vec())
     } else {
+        warn!("RSA sign requested with legacy SHA-1 (ssh-rsa); this is deprecated since OpenSSH 8.8");
         let sig = SigningKey::<sha1::Sha1>::new_unprefixed(private_key).sign(data);
         ("ssh-rsa", sig.to_vec())
     };
