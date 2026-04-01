@@ -17,6 +17,7 @@ const ATTR_SCHEMA_VALUE: &str = "org.freedesktop.Secret.Generic";
 
 /// Metadata for a stored SSH key, extracted from Secret Service item attributes.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // algorithm is stored in keyring attributes for future filtering
 pub struct SshKeyMeta {
     pub fingerprint: String,
     pub comment: String,
@@ -156,6 +157,7 @@ impl SshKeyring {
     }
 
     /// Lock the backing collection.
+    #[allow(dead_code)] // available for future keyring-level locking
     pub async fn lock(&self) -> Result<()> {
         self.inner.lock().await?;
         Ok(())
