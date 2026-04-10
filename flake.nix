@@ -3,75 +3,46 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
-    rust-overlay.url = "github:oxalica/rust-overlay";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = {
-    self,
-    nixpkgs,
-    flake-utils,
-    rust-overlay,
-    ...
-  }:
-    flake-utils.lib.eachDefaultSystem (
-      system: let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [rust-overlay.overlays.default];
-        };
+  outputs = {self, nixpkgs, fenix, ...}: let
+    forAllSystems = nixpkgs.lib.genAttrs ["x86_64-linux" "aarch64-linux"];
+  in {
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      oo7-ssh-agent = pkgs.rustPlatform.buildRustPackage {
+        pname = "oo7-ssh-agent";
+        version = "0.1.0";
+        src = ./.;
+        cargoLock.lockFile = ./Cargo.lock;
+        nativeBuildInputs = [pkgs.pkg-config];
+        buildInputs = [pkgs.dbus pkgs.dbus.lib];
+        doCheck = false;
+      };
+      default = self.packages.${system}.oo7-ssh-agent;
+    });
 
-        rustTools = {
-          stable = pkgs.rust-bin.stable."1.89.0".default.override {
-            extensions = ["rust-src"];
-          };
-          analyzer = pkgs.rust-bin.stable."1.89.0".rust-analyzer;
-        };
-
-        devTools = with pkgs; [
-          cargo-expand
-          pkg-config
+    devShells = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      toolchain = fenix.packages.${system}.stable.withComponents [
+        "cargo" "clippy" "rust-src" "rustc" "rustfmt"
+      ];
+    in {
+      default = pkgs.mkShell {
+        nativeBuildInputs = [
+          toolchain
+          fenix.packages.${system}.rust-analyzer
+          pkgs.pkg-config
+          pkgs.cargo-expand
+          pkgs.dbus
+          pkgs.dbus.lib
         ];
-
-        # Runtime/build dependencies for D-Bus (required by oo7/zbus)
-        dbusDeps = with pkgs; [
-          dbus
-          dbus.lib
-        ];
-      in {
-        packages = {
-          oo7-ssh-agent = pkgs.rustPlatform.buildRustPackage {
-            pname = "oo7-ssh-agent";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-
-            nativeBuildInputs = with pkgs; [pkg-config];
-            buildInputs = dbusDeps;
-
-            doCheck = false;
-          };
-
-          default = self.packages.${system}.oo7-ssh-agent;
-        };
-
-        devShells.default = pkgs.mkShell {
-          name = "oo7-ssh-agent-dev";
-          buildInputs =
-            [
-              rustTools.stable
-              rustTools.analyzer
-            ]
-            ++ devTools
-            ++ dbusDeps;
-
-          shellHook = ''
-            echo "oo7-ssh-agent dev shell — $(rustc --version)"
-            export CARGO_HOME="$HOME/.cargo"
-            export RUSTUP_HOME="$HOME/.rustup"
-            mkdir -p "$CARGO_HOME" "$RUSTUP_HOME"
-          '';
-        };
-      }
-    );
+      };
+    });
+  };
 }
